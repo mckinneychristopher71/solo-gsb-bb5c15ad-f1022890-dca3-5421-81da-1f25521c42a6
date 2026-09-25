@@ -152,8 +152,12 @@ def test_impact_applies_review_consensus(client):
               "901 Impfx Delta Avenue, Impfx City"):
         m = client.post("/api/match", json={"query": q}).json()
         assert m["status"] == "needs_review"
+        claim = client.post(f"/api/matches/{m['match_id']}/claim",
+                            json={"reviewer": "pytest"})
+        assert claim.status_code == 200
         r = client.post(f"/api/matches/{m['match_id']}/review",
-                        json={"action": "confirmed"})
+                        json={"action": "confirmed",
+                              "token": claim.json()["token"]})
         assert r.status_code == 200
 
     # Same normalised key, different surface form: consensus redirects it.

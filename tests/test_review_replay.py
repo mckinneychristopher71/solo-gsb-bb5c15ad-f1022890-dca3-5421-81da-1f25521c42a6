@@ -1,6 +1,8 @@
 """Tests for the review verdict replay (``/api/review-replay``)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -24,8 +26,45 @@ def _match_save(client, query: str) -> dict:
     return r.json()
 
 
+def _seed_review_direct(match_id: int, action: str,
+                        selected_id: int | None = None) -> None:
+    """Write a review verdict straight through the persistence layer.
+
+    The claim+review API only serves *pending* records, so verdicts on
+    auto_matched / no_match logs are seeded directly here, mirroring what the
+    review endpoint writes (chosen-address snapshot included).
+    """
+    conn = get_conn()
+    row = db.get_match_log(conn, match_id)
+    assert row is not None
+    score = text = None
+    if action in ("confirmed", "overridden"):
+        if action == "confirmed":
+            selected_id = row["candidate_id"]
+            score = row["score"]
+        else:
+            for cand in json.loads(row["candidates_json"]):
+                if cand["address"]["id"] == selected_id:
+                    score = cand["score"]
+                    break
+        addr = db.get_address(conn, selected_id)
+        text = addr["full_text"] if addr else None
+    db.review_match_log(
+        conn, match_id, action=action,
+        selected_id=selected_id, score=score, selected_text=text,
+    )
+    conn.commit()
+
+
 def _review(client, match_id: int, action: str, selected_id: int | None = None) -> None:
-    body: dict = {"action": action}
+    status = client.get(f"/api/matches/{match_id}").json()["status"]
+    if status != "needs_review":
+        _seed_review_direct(match_id, action, selected_id)
+        return
+    # Pending records go through the real claim + token review flow.
+    claim = client.post(f"/api/matches/{match_id}/claim", json={"reviewer": "pytest"})
+    assert claim.status_code == 200, claim.text
+    body: dict = {"action": action, "token": claim.json()["token"]}
     if selected_id is not None:
         body["selected_id"] = selected_id
     r = client.post(f"/api/matches/{match_id}/review", json=body)

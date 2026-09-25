@@ -131,7 +131,13 @@
     <section id="tab-review" class="panel">
         <div class="card">
             <h2>待确认队列</h2>
-            <div class="row">
+            <p class="hint">
+                单条复核实行<b>领取制</b>：填写复核员姓名后点击记录上的「领取」，
+                获得 <b>10 分钟租约</b>与复核令牌；同一时刻一条记录只允许一个有效令牌，
+                过期后可重新领取。提交复核须持有有效令牌（过期、旧令牌或重复提交会被拒绝），
+                也可随时「释放」让出记录。同案整组复核遇到仍被领取的成员会整体拒绝。
+            </p>
+            <div class="row wrap">
                 <select id="review-filter">
                     <option value="needs_review">仅待确认</option>
                     <option value="">全部记录</option>
@@ -139,6 +145,11 @@
                     <option value="auto_matched">自动命中</option>
                     <option value="no_match">无匹配</option>
                 </select>
+                <label class="reviewer-field">
+                    复核员
+                    <input type="text" id="reviewer-name" maxlength="40"
+                           placeholder="输入姓名后领取记录">
+                </label>
                 <button id="btn-refresh-review" class="ghost">刷新</button>
             </div>
             <div id="review-groups"></div>

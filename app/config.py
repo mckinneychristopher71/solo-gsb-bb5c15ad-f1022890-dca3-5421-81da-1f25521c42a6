@@ -20,6 +20,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     db_path: str
@@ -34,6 +44,9 @@ class Settings:
     # Weight of the street/name token score in the final score
     # (the remainder is the house-number score).
     token_weight: float
+    # Seconds a claimed review lease stays valid before the record can be
+    # claimed again (default 10 minutes).
+    review_lease_seconds: int
     host: str
     port: int
 
@@ -55,6 +68,7 @@ def get_settings() -> Settings:
         margin_threshold=_env_float("MARGIN_THRESHOLD", 0.06),
         reject_threshold=_env_float("REJECT_THRESHOLD", 0.35),
         token_weight=_env_float("TOKEN_WEIGHT", 0.7),
+        review_lease_seconds=_env_int("REVIEW_LEASE_SECONDS", 600),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
     )

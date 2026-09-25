@@ -48,6 +48,21 @@ class AddressBatchIn(BaseModel):
 class ReviewAction(BaseModel):
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+    # Bearer token obtained by claiming the record first; verified inside the
+    # review write transaction (missing/expired/stale -> 409).
+    token: str | None = Field(None, description="领取该记录时获得的复核令牌")
+
+
+class ClaimAction(BaseModel):
+    """领取待确认记录：复核员姓名 + 10 分钟租约。"""
+    reviewer: constr(strip_whitespace=True, min_length=1, max_length=40) = Field(
+        ..., description="复核员姓名（展示在待办列表中）"
+    )
+
+
+class ReleaseAction(BaseModel):
+    """提前释放领取租约：须持有当前有效令牌。"""
+    token: str = Field(..., min_length=1, description="领取时获得的复核令牌")
 
 
 class GroupReviewAction(BaseModel):

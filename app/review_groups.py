@@ -11,7 +11,9 @@ the whole group) is applied inside a single SQLite write transaction: the
 group is recomputed from the live table after the write lock is acquired, and
 every member is re-checked to still be pending with an unchanged signature and
 member set.  Any drift aborts the transaction -- nothing is written -- and the
-caller gets a conflict (HTTP 409).
+caller gets a conflict (HTTP 409).  The group review is likewise refused
+wholesale while any member is still claimed by a reviewer (see
+``app/review_claims.py``), so the merged path cannot bypass an active lease.
 """
 from __future__ import annotations
 
@@ -47,10 +49,16 @@ def _group_key(norm_key: dict[str, Any],
 
 
 def compute_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Group all pending review records; each group carries its shared candidates."""
+    """Group all pending review records; each group carries its shared candidates.
+
+    Members are annotated with their active review claim (if any) so the
+    queue can show who holds which record and the group review can refuse to
+    bypass an active occupancy.
+    """
     rows = conn.execute(
         "SELECT * FROM match_logs WHERE status = 'needs_review' ORDER BY id"
     ).fetchall()
+    claims = db.active_claim_map(conn, [row["id"] for row in rows])
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
         candidates = json.loads(row["candidates_json"])
@@ -67,10 +75,13 @@ def compute_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 "queries": [],
             }
             buckets[key] = bucket
+        claim = claims.get(row["id"])
         bucket["queries"].append({
             "id": row["id"],
             "query": row["query"],
             "created_at": row["created_at"],
+            "claimed_by": claim["reviewer"] if claim else None,
+            "claim_expires_at": claim["expires_at"] if claim else None,
         })
     groups: list[dict[str, Any]] = []
     for bucket in buckets.values():
@@ -104,6 +115,17 @@ def apply_group_review(conn: sqlite3.Connection, *, group_key: str,
             raise GroupConflict("同案组已不存在或成员已全部复核，请刷新后重试")
         if sorted(group["match_ids"]) != requested:
             raise GroupConflict("同案组成员集合已变化，请刷新后重试")
+
+        # A member with an active claim is being handled individually: refuse
+        # the whole group so the merged path cannot bypass that occupancy.
+        claimed = [q for q in group["queries"] if q["claimed_by"]]
+        if claimed:
+            first = claimed[0]
+            raise GroupConflict(
+                f"组成员 #{first['id']} 正被 {first['claimed_by']} 领取"
+                f"（租约至 {first['claim_expires_at']}），"
+                "为避免绕过占用，整组未写入；请先释放或等待租约到期"
+            )
 
         shared_ids = {c["address"]["id"] for c in group["candidates"]}
         if action == "overridden":

@@ -86,6 +86,22 @@ CREATE TABLE IF NOT EXISTS ab_experiments (
     summary_json    TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+
+-- Manual-review claims: a reviewer "checks out" one pending record for a
+-- short lease.  At most one row per match_id is *active* at any moment
+-- (active = released_at IS NULL AND expires_at > now); that invariant is
+-- enforced by the claim transaction in app/review_claims.py.  Old rows are
+-- kept as an audit trail of who held which record.
+CREATE TABLE IF NOT EXISTS review_claims (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id    INTEGER NOT NULL REFERENCES match_logs(id) ON DELETE CASCADE,
+    token       TEXT NOT NULL UNIQUE,       -- bearer token required at review time
+    reviewer    TEXT NOT NULL,              -- display name typed by the reviewer
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,              -- lease end (created_at + lease seconds)
+    released_at TEXT                        -- set on manual release or review submit
+);
+CREATE INDEX IF NOT EXISTS idx_review_claims_match ON review_claims(match_id);
 """
 
 
@@ -383,6 +399,80 @@ def count_match_logs(conn: sqlite3.Connection, status: str | None = None) -> int
             .fetchone()[0]
         )
     return int(conn.execute("SELECT COUNT(*) FROM match_logs").fetchone()[0])
+
+
+# -------------------------------------------------------------- review claims --
+
+
+def insert_claim(conn: sqlite3.Connection, *, match_id: int, token: str,
+                 reviewer: str, ttl_seconds: int) -> str:
+    """Insert a claim row; returns its ``expires_at`` (lease end) timestamp."""
+    now = datetime.now(timezone.utc)
+    expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, tz=timezone.utc)
+    expires_at = expires.isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO review_claims
+            (match_id, token, reviewer, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (match_id, token, reviewer, now.isoformat(timespec="seconds"), expires_at),
+    )
+    return expires_at
+
+
+def get_claim_by_token(conn: sqlite3.Connection, match_id: int,
+                       token: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM review_claims WHERE match_id = ? AND token = ?",
+        (match_id, token),
+    ).fetchone()
+
+
+def get_active_claim(conn: sqlite3.Connection, match_id: int) -> sqlite3.Row | None:
+    """The currently valid claim for a record (unreleased and unexpired)."""
+    return conn.execute(
+        """
+        SELECT * FROM review_claims
+         WHERE match_id = ? AND released_at IS NULL AND expires_at > ?
+         ORDER BY id DESC LIMIT 1
+        """,
+        (match_id, _now()),
+    ).fetchone()
+
+
+def active_claim_map(conn: sqlite3.Connection,
+                     match_ids: list[int] | None = None) -> dict[int, sqlite3.Row]:
+    """``{match_id: claim_row}`` for every currently active claim.
+
+    With ``match_ids`` given, only those records are looked up (one query).
+    """
+    now = _now()
+    if match_ids is not None:
+        if not match_ids:
+            return {}
+        marks = ",".join("?" for _ in match_ids)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM review_claims
+             WHERE released_at IS NULL AND expires_at > ? AND match_id IN ({marks})
+            """,
+            (now, *match_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM review_claims WHERE released_at IS NULL AND expires_at > ?",
+            (now,),
+        ).fetchall()
+    return {row["match_id"]: row for row in rows}
+
+
+def release_claim(conn: sqlite3.Connection, claim_id: int) -> None:
+    """Close a claim (manual release or consumed by a submitted review)."""
+    conn.execute(
+        "UPDATE review_claims SET released_at = ? WHERE id = ?",
+        (_now(), claim_id),
+    )
 
 
 # ----------------------------------------------------------- A/B experiments --

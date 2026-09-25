@@ -43,6 +43,66 @@ function pct(value) {
     return value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`;
 }
 
+// ------------------------------------------------------- review claim leases
+
+// Bearer tokens for records this browser has claimed, persisted so a page
+// refresh does not strand the lease (tokens expire server-side after the
+// 10-minute lease anyway, and stale ones are rejected with 409).
+let claimTokens = {};
+try {
+    claimTokens = JSON.parse(localStorage.getItem("reviewClaimTokens") || "{}") || {};
+} catch (err) {
+    claimTokens = {};
+}
+
+function saveClaimTokens() {
+    localStorage.setItem("reviewClaimTokens", JSON.stringify(claimTokens));
+}
+
+function getClaimToken(matchId) {
+    return claimTokens[matchId] || null;
+}
+
+function setClaimToken(matchId, token) {
+    claimTokens[matchId] = token;
+    saveClaimTokens();
+}
+
+function dropClaimToken(matchId) {
+    delete claimTokens[matchId];
+    saveClaimTokens();
+}
+
+function reviewerName() {
+    const input = $("#reviewer-name");
+    return ((input && input.value) || localStorage.getItem("reviewerName") || "").trim();
+}
+
+function setReviewerName(name) {
+    localStorage.setItem("reviewerName", name);
+    const input = $("#reviewer-name");
+    if (input) input.value = name;
+}
+
+// Claim the record on demand (used by the review buttons when the record is
+// not held yet); returns the valid bearer token for this record.
+async function ensureClaimToken(matchId) {
+    const held = getClaimToken(matchId);
+    if (held) return held;
+    let name = reviewerName();
+    if (!name) {
+        name = (prompt("请输入复核员姓名以领取该记录（10 分钟租约）：") || "").trim();
+        if (!name) throw new Error("已取消：复核前需输入姓名领取该记录");
+        setReviewerName(name);
+    }
+    const data = await api(`/api/matches/${matchId}/claim`, {
+        method: "POST",
+        body: JSON.stringify({ reviewer: name }),
+    });
+    setClaimToken(matchId, data.token);
+    return data.token;
+}
+
 // ------------------------------------------------------------------- render
 
 function renderTokens(cand) {
@@ -255,24 +315,41 @@ $("#results").addEventListener("click", onReviewClick);
 async function onReviewClick(event) {
     const btn = event.target.closest("button[data-log]");
     if (!btn) return;
+    const isReject = btn.classList.contains("candidate-reject");
+    const isOverride = btn.classList.contains("candidate-override");
+    const isConfirm = btn.classList.contains("candidate-confirm");
+    if (!isReject && !isOverride && !isConfirm) return;  // claim/release buttons
     const logId = Number(btn.dataset.log);
     let body;
-    if (btn.classList.contains("candidate-reject")) {
+    if (isReject) {
         body = { action: "rejected" };
     } else {
         body = {
-            action: btn.classList.contains("candidate-override") ? "overridden" : "confirmed",
+            action: isOverride ? "overridden" : "confirmed",
             selected_id: Number(btn.dataset.address),
         };
     }
     btn.disabled = true;
     try {
+        // Single-record reviews must carry the lease token: claim on demand
+        // when this browser does not hold one for the record yet.
+        body.token = await ensureClaimToken(logId);
+    } catch (err) {
+        btn.disabled = false;
+        alert(err.message);
+        return;
+    }
+    try {
         await api(`/api/matches/${logId}/review`, { method: "POST", body: JSON.stringify(body) });
+        // The lease is consumed by the submitted review.
+        dropClaimToken(logId);
         btn.textContent = "✓ 已记录";
         btn.classList.add("confirm");
         await refreshHealth();
         refreshReplayBadge();
     } catch (err) {
+        // 409：令牌过期/被取代或记录已复核——本地令牌已不可用，丢弃并提示刷新。
+        dropClaimToken(logId);
         btn.disabled = false;
         alert(err.message);
     }
@@ -591,6 +668,27 @@ async function loadImpact() {
 
 // ------------------------------------------------------------- review queue
 
+// Claim banner + 领取/释放 buttons for one pending record.  The token itself
+// never leaves the browser store; the list only shows reviewer + lease end.
+function renderClaimBar(item) {
+    const held = getClaimToken(item.id);
+    if (item.claim) {
+        return `
+        <div class="claim-bar${held ? " mine" : ""}">
+            <span class="claim-chip">🔒 已由 <b>${escapeHtml(item.claim.reviewer)}</b> 领取</span>
+            <span class="muted">租约至 ${escapeHtml(item.claim.expires_at)}</span>
+            ${held
+                ? `<button class="tiny ghost claim-release" data-log="${item.id}">释放</button>`
+                : '<span class="muted">（他人持有期间不可复核，可等待租约到期）</span>'}
+        </div>`;
+    }
+    return `
+    <div class="claim-bar free">
+        <span class="claim-chip free">🔓 未被领取</span>
+        <button class="tiny confirm claim-claim" data-log="${item.id}">领取（10 分钟租约）</button>
+    </div>`;
+}
+
 async function loadReview() {
     const status = $("#review-filter").value;
     const list = $("#review-list");
@@ -611,9 +709,13 @@ async function loadReview() {
             const consensusTargetId = item.consensus && item.consensus.applied
                 ? item.consensus.target_id
                 : null;
+            // Claimed by someone else -> hide this browser's review buttons.
+            const lockedByOther = item.status === "needs_review"
+                && item.claim && !getClaimToken(item.id);
+            const reviewable = item.status === "needs_review" && !lockedByOther;
             const candidateHtml = item.candidates.length
                 ? item.candidates.map((c, i) => renderCandidate(c, i, {
-                    reviewable: item.status === "needs_review",
+                    reviewable,
                     logId: item.id,
                     consensusTargetId,
                 })).join("")
@@ -624,9 +726,10 @@ async function loadReview() {
                 <div class="muted">记录 #${item.id} · ${escapeHtml(item.created_at || "")}</div>
                 <span class="status ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>
                 ${item.review_action ? `<span class="muted">复核动作：${escapeHtml(item.review_action)}</span>` : ""}
+                ${item.status === "needs_review" ? renderClaimBar(item) : ""}
                 ${renderConsensus(item.consensus)}
                 ${candidateHtml}
-                ${item.status === "needs_review" ? `
+                ${reviewable ? `
                 <div class="review-actions">
                     <button class="tiny reject candidate-reject" data-log="${item.id}">标记为无匹配</button>
                 </div>` : ""}
@@ -641,7 +744,58 @@ $("#btn-refresh-review").addEventListener("click", loadReview);
 $("#review-filter").addEventListener("change", loadReview);
 $("#review-list").addEventListener("click", async (event) => {
     await onReviewClick(event);
-    if (event.target.closest("button[data-log]")) loadReview();
+    if (event.target.closest("button.candidate-confirm, button.candidate-override, button.candidate-reject")) {
+        loadReview();
+    }
+});
+
+// Reviewer name is shared by all claim buttons and persisted locally.
+$("#reviewer-name").value = localStorage.getItem("reviewerName") || "";
+$("#reviewer-name").addEventListener("change", (event) => {
+    localStorage.setItem("reviewerName", event.target.value.trim());
+});
+
+// 领取 / 释放 buttons on pending records (delegated from the queue list).
+$("#review-list").addEventListener("click", async (event) => {
+    const claimBtn = event.target.closest("button.claim-claim");
+    if (claimBtn) {
+        const name = reviewerName();
+        if (!name) {
+            alert("请先在上方「复核员」输入姓名，再领取记录。");
+            $("#reviewer-name").focus();
+            return;
+        }
+        claimBtn.disabled = true;
+        try {
+            const data = await api(`/api/matches/${claimBtn.dataset.log}/claim`, {
+                method: "POST",
+                body: JSON.stringify({ reviewer: name }),
+            });
+            setClaimToken(Number(claimBtn.dataset.log), data.token);
+        } catch (err) {
+            // 409：已被他人领取或状态已变化，刷新后展示最新占用。
+            alert(err.message);
+        }
+        loadReview();
+        return;
+    }
+    const releaseBtn = event.target.closest("button.claim-release");
+    if (releaseBtn) {
+        const logId = Number(releaseBtn.dataset.log);
+        const token = getClaimToken(logId);
+        releaseBtn.disabled = true;
+        try {
+            await api(`/api/matches/${logId}/release`, {
+                method: "POST",
+                body: JSON.stringify({ token }),
+            });
+        } catch (err) {
+            // 令牌已失效（过期/已释放）：本地同样丢弃，刷新展示最新状态。
+            alert(err.message);
+        }
+        dropClaimToken(logId);
+        loadReview();
+    }
 });
 
 // ------------------------------------------------- same-case merged review
@@ -653,7 +807,17 @@ function renderGroup(group) {
     const queries = group.queries.map((m) => `
         <div class="gq">🔍 ${escapeHtml(m.query)}
             <span class="muted">记录 #${m.id}</span>
+            ${m.claimed_by
+                ? `<span class="claim-chip">🔒 ${escapeHtml(m.claimed_by)} 领取 · 至 ${escapeHtml(m.claim_expires_at || "")}</span>`
+                : ""}
         </div>`).join("");
+    const claimed = group.queries.filter((m) => m.claimed_by);
+    const claimWarning = claimed.length
+        ? `<div class="claim-bar locked-group">
+               ⚠ 组内 ${claimed.length} 条记录仍被领取（${escapeHtml(claimed[0].claimed_by)} 等），
+               整组复核将被整体拒绝；请先释放或等待租约到期后刷新。
+           </div>`
+        : "";
     const candidates = group.candidates
         .map((c, i) => renderCandidate(c, i, {}))
         .join("") || '<div class="meta muted">无候选</div>';
@@ -672,6 +836,7 @@ function renderGroup(group) {
             </span>
         </div>
         <div class="group-queries">${queries}</div>
+        ${claimWarning}
         ${candidates}
         <div class="review-actions">
             ${best ? `<button class="tiny confirm group-action" data-action="confirmed">
