@@ -20,7 +20,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import db
+from . import db, review_claims
 from .consensus import norm_key
 
 
@@ -51,6 +51,7 @@ def compute_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM match_logs WHERE status = 'needs_review' ORDER BY id"
     ).fetchall()
+    claims = db.active_review_claims(conn, [r["id"] for r in rows])
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
         candidates = json.loads(row["candidates_json"])
@@ -67,15 +68,28 @@ def compute_groups(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 "queries": [],
             }
             buckets[key] = bucket
-        bucket["queries"].append({
+        member = {
             "id": row["id"],
             "query": row["query"],
             "created_at": row["created_at"],
-        })
+        }
+        claim = claims.get(row["id"])
+        if claim is not None:
+            # Only the holder needs the token itself; list views expose who
+            # holds the record and until when (see /api/matches for the token).
+            member["claimed_by"] = claim["claimed_by"]
+            member["claim_expires_at"] = claim["expires_at"]
+        bucket["queries"].append(member)
     groups: list[dict[str, Any]] = []
     for bucket in buckets.values():
         bucket["count"] = len(bucket["queries"])
         bucket["match_ids"] = [m["id"] for m in bucket["queries"]]
+        claimed = {m["id"]: m for m in bucket["queries"] if "claimed_by" in m}
+        bucket["claimed_members"] = [
+            {"match_id": mid, "claimed_by": m["claimed_by"],
+             "claim_expires_at": m["claim_expires_at"]}
+            for mid, m in sorted(claimed.items())
+        ]
         groups.append(bucket)
     # Largest groups first, then oldest record first for a stable display.
     groups.sort(key=lambda g: (-g["count"], g["match_ids"][0]))
@@ -104,6 +118,11 @@ def apply_group_review(conn: sqlite3.Connection, *, group_key: str,
             raise GroupConflict("同案组已不存在或成员已全部复核，请刷新后重试")
         if sorted(group["match_ids"]) != requested:
             raise GroupConflict("同案组成员集合已变化，请刷新后重试")
+
+        # Occupancy guard: a group verdict must not overwrite records another
+        # reviewer has individually claimed.  Any live lease rejects the whole
+        # group (checked inside this write transaction).
+        review_claims.assert_group_members_free(conn, group["match_ids"])
 
         shared_ids = {c["address"]["id"] for c in group["candidates"]}
         if action == "overridden":
@@ -149,6 +168,9 @@ def apply_group_review(conn: sqlite3.Connection, *, group_key: str,
                 score=member_score,
                 selected_text=member_text,
             )
+            # Drop any lease row (live ones were refused above; this also
+            # removes an expired stale row so it cannot linger after review).
+            db.delete_review_claim(conn, match_id)
 
     return {
         "group_key": group_key,

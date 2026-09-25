@@ -19,6 +19,7 @@ from . import (
     experiments,
     import_impact,
     ingest,
+    review_claims,
     review_groups,
     review_replay,
 )
@@ -32,6 +33,8 @@ from .schemas import (
     GroupReviewAction,
     MatchRequest,
     ReviewAction,
+    ReviewClaimIn,
+    ReviewReleaseIn,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -324,8 +327,9 @@ def api_match_batch(payload: BatchMatchRequest,
 # --- review queue -----------------------------------------------------------
 
 
-def _serialize_log(row: db.sqlite3.Row) -> dict[str, Any]:
-    return {
+def _serialize_log(row: db.sqlite3.Row,
+                   claim: db.sqlite3.Row | None = None) -> dict[str, Any]:
+    data = {
         "id": row["id"],
         "query": row["query"],
         "status": row["status"],
@@ -344,7 +348,13 @@ def _serialize_log(row: db.sqlite3.Row) -> dict[str, Any]:
         "consensus": json.loads(row["consensus_json"]) if row["consensus_json"] else None,
         "created_at": row["created_at"],
         "reviewed_at": row["reviewed_at"],
+        # Manual-review occupancy: null when the record is not currently
+        # claimed (or the lease already expired).
+        "claimed_by": claim["claimed_by"] if claim is not None else None,
+        "claim_expires_at": claim["expires_at"] if claim is not None else None,
+        "claim_token": claim["token"] if claim is not None else None,
     }
+    return data
 
 
 @app.get("/api/matches")
@@ -354,10 +364,11 @@ def list_matches(status: str | None = None, limit: int = 100, offset: int = 0,
         raise HTTPException(status_code=400, detail="非法 status 过滤值")
     limit = max(1, min(limit, 500))
     rows = db.list_match_logs(conn, status=status, limit=limit, offset=offset)
+    claims = db.active_review_claims(conn, [r["id"] for r in rows])
     return {
         "total": db.count_match_logs(conn, status),
         "needs_review": db.count_match_logs(conn, "needs_review"),
-        "items": [_serialize_log(r) for r in rows],
+        "items": [_serialize_log(r, claims.get(r["id"])) for r in rows],
     }
 
 
@@ -367,58 +378,72 @@ def get_match(match_id: int,
     row = db.get_match_log(conn, match_id)
     if row is None:
         raise HTTPException(status_code=404, detail="匹配记录不存在")
-    return _serialize_log(row)
+    claims = db.active_review_claims(conn, [match_id])
+    return _serialize_log(row, claims.get(match_id))
+
+
+@app.post("/api/matches/{match_id}/claim")
+def claim_match(match_id: int, payload: ReviewClaimIn,
+                conn: db.sqlite3.Connection = Depends(get_conn),
+                settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
+    """领取一条待确认记录：复核员姓名换取十分钟有效的唯一租约令牌。
+
+    领取在 SQLite 写事务（BEGIN IMMEDIATE）内完成；记录必须仍为待确认、
+    且当前没有他人未过期的租约，否则返回 409。租约过期后可重新领取。
+    """
+    try:
+        return review_claims.claim_lease(
+            conn, match_id=match_id, reviewer=payload.reviewer,
+            ttl_seconds=settings.review_lease_seconds,
+        )
+    except review_claims.ClaimBadRequest as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except review_claims.ClaimNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except review_claims.ClaimConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/matches/{match_id}/release")
+def release_match(match_id: int, payload: ReviewReleaseIn,
+                  conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """主动释放领取租约（仅当前持有者的有效令牌可释放）。"""
+    try:
+        return review_claims.release_lease(
+            conn, match_id=match_id, token=payload.token,
+        )
+    except review_claims.ClaimBadRequest as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except review_claims.ClaimNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except review_claims.ClaimConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/matches/{match_id}/review")
 def review_match(match_id: int, payload: ReviewAction,
                  conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
-    row = db.get_match_log(conn, match_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="匹配记录不存在")
+    """单条人工复核：必须先领取记录并携带有效的租约令牌。
 
-    score: float | None = None
-    selected_text: str | None = None
-    if payload.action == "overridden":
-        if payload.selected_id is None:
-            raise HTTPException(status_code=400, detail="改派时必须提供 selected_id")
-        target = db.get_address(conn, payload.selected_id)
-        if target is None:
-            raise HTTPException(status_code=404, detail="所选标准地址不存在")
-        selected_text = target["full_text"]
-        candidates = json.loads(row["candidates_json"])
-        for cand in candidates:
-            if cand["address"]["id"] == payload.selected_id:
-                score = cand["score"]
-                break
-    elif payload.action == "confirmed":
-        payload = ReviewAction(action="confirmed", selected_id=row["candidate_id"])
-        score = row["score"]
-        # Persist the chosen address's own ID/full text even when it is only
-        # referenced via candidate_id (the candidates_json is the snapshot).
-        if row["candidate_id"] is not None:
-            chosen = db.get_address(conn, row["candidate_id"])
-            if chosen is not None:
-                selected_text = chosen["full_text"]
-            else:
-                # Defensive: candidate row gone before review; restore the text
-                # from the log's own candidate snapshot rather than losing it.
-                for cand in json.loads(row["candidates_json"]):
-                    if cand["address"]["id"] == row["candidate_id"]:
-                        selected_text = cand["address"]["full_text"]
-                        break
-
-    with db.transaction(conn):
-        db.review_match_log(
+    服务端在同一个 SQLite 写事务内核验令牌（存在、未过期、与当前租约一致）
+    与记录仍为待确认状态，然后写入复核结论并删除租约。令牌缺失 / 过期 /
+    旧令牌 / 重复提交均返回 409，结论一条也不写入。
+    """
+    try:
+        result = review_claims.review_with_lease(
             conn,
-            match_id,
+            match_id=match_id,
             action=payload.action,
             selected_id=payload.selected_id,
-            score=score,
-            selected_text=selected_text,
+            token=payload.token,
         )
-    return {"ok": True, "match_id": match_id, "action": payload.action,
-            "selected_id": payload.selected_id}
+    except review_claims.ClaimBadRequest as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except review_claims.ClaimNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except review_claims.ClaimConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result
 
 
 # --- same-case merged review ------------------------------------------------
@@ -443,7 +468,8 @@ def review_group(payload: GroupReviewAction,
     """对整组执行确认首选 / 改派共同候选 / 判无匹配。
 
     服务端在同一个 SQLite 写事务内重新核对成员仍待确认、组签名与成员集合
-    未变；若有变化返回 409 冲突且一条也不写入。
+    未变；若有变化返回 409 冲突且一条也不写入。组内若存在仍被他人领取
+    （租约未过期）的成员，整组复核同样被整体拒绝（409），避免绕过占用。
     """
     if payload.action == "overridden" and payload.selected_id is not None:
         if db.get_address(conn, payload.selected_id) is None:
@@ -456,6 +482,9 @@ def review_group(payload: GroupReviewAction,
             action=payload.action,
             selected_id=payload.selected_id,
         )
+    except review_claims.ClaimConflict as exc:
+        # A member is currently claimed: the group verdict is refused wholesale.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except review_groups.GroupConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except review_groups.GroupReviewError as exc:

@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS ab_experiments (
     summary_json    TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
+
+-- At most one live lease per pending match log: match_id is the primary key,
+-- so two claimants can never both win under a write transaction.  Expired rows
+-- are overwritten on re-claim and removed when the record is reviewed/released.
+CREATE TABLE IF NOT EXISTS review_claims (
+    match_id    INTEGER PRIMARY KEY REFERENCES match_logs(id) ON DELETE CASCADE,
+    token       TEXT NOT NULL UNIQUE,
+    claimed_by  TEXT NOT NULL,             -- reviewer name supplied at claim time
+    claimed_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_claims_expires ON review_claims(expires_at);
 """
 
 
@@ -431,3 +443,68 @@ def list_ab_experiments(conn: sqlite3.Connection, limit: int = 50,
 
 def count_ab_experiments(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM ab_experiments").fetchone()[0])
+
+
+# ----------------------------------------------------------- review claims --
+
+
+def upsert_review_claim(conn: sqlite3.Connection, *, match_id: int, token: str,
+                        claimed_by: str, ttl_seconds: int) -> None:
+    """Write (or overwrite) the single lease row for a match log.
+
+    ``match_id`` is the primary key, so a record can have at most one row.
+    Callers must run this inside a ``BEGIN IMMEDIATE`` transaction after
+    checking that any existing row is expired -- the upsert itself would
+    happily replace a live lease, and the transaction-level pre-check is what
+    enforces the "one valid token at a time" rule.
+    """
+    now = datetime.now(timezone.utc)
+    expires = datetime.fromtimestamp(now.timestamp() + ttl_seconds, tz=timezone.utc)
+    conn.execute(
+        """
+        INSERT INTO review_claims (match_id, token, claimed_by, claimed_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(match_id) DO UPDATE SET
+            token = excluded.token,
+            claimed_by = excluded.claimed_by,
+            claimed_at = excluded.claimed_at,
+            expires_at = excluded.expires_at
+        """,
+        (
+            match_id,
+            token,
+            claimed_by,
+            now.isoformat(timespec="seconds"),
+            expires.isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def get_review_claim(conn: sqlite3.Connection, match_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM review_claims WHERE match_id = ?", (match_id,)
+    ).fetchone()
+
+
+def active_review_claims(conn: sqlite3.Connection,
+                         match_ids: list[int] | None = None) -> dict[int, sqlite3.Row]:
+    """Live (unexpired) leases keyed by match_id; expired rows are ignored."""
+    now = _now()
+    if match_ids is None:
+        rows = conn.execute(
+            "SELECT * FROM review_claims WHERE expires_at > ?", (now,)
+        ).fetchall()
+    elif not match_ids:
+        return {}
+    else:
+        placeholders = ",".join("?" for _ in match_ids)
+        rows = conn.execute(
+            f"SELECT * FROM review_claims WHERE expires_at > ? "
+            f"AND match_id IN ({placeholders})",
+            (now, *match_ids),
+        ).fetchall()
+    return {int(r["match_id"]): r for r in rows}
+
+
+def delete_review_claim(conn: sqlite3.Connection, match_id: int) -> None:
+    conn.execute("DELETE FROM review_claims WHERE match_id = ?", (match_id,))

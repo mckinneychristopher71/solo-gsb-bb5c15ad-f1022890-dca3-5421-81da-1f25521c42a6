@@ -43,6 +43,131 @@ function pct(value) {
     return value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`;
 }
 
+// ------------------------------------------------------- review claim leases
+
+// Tokens acquired in this browser session, keyed by match log id.  Persisted
+// to localStorage so a page refresh does not lose a lease the server still
+// considers ours.
+function loadClaimTokens() {
+    try {
+        return JSON.parse(localStorage.getItem("reviewClaimTokens") || "{}");
+    } catch (err) {
+        return {};
+    }
+}
+
+const claimTokens = loadClaimTokens();
+
+function saveClaimTokens() {
+    localStorage.setItem("reviewClaimTokens", JSON.stringify(claimTokens));
+}
+
+function reviewerName() {
+    const input = $("#reviewer-name");
+    return input ? input.value.trim() : "";
+}
+
+function ensureReviewerName() {
+    const name = reviewerName();
+    if (name) return name;
+    const input = $("#reviewer-name");
+    if (input) {
+        input.focus();
+        alert("请先在页面上方输入复核员姓名，再领取待确认记录。");
+    }
+    return "";
+}
+
+function fmtLeaseTime(iso) {
+    if (!iso) return "";
+    // Leases are absolute UTC instants; render them in the viewer's timezone.
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime())
+        ? iso
+        : d.toLocaleString([], { hour12: false });
+}
+
+function claimRemainingMs(item) {
+    if (!item || !item.claim_expires_at) return 0;
+    return new Date(item.claim_expires_at).getTime() - Date.now();
+}
+
+// Occupancy state of a pending item:
+//   free       - no live lease
+//   mine       - live lease held by this browser (its token matches ours)
+//   claimed    - live lease held by someone else, or our stored token is stale
+function claimState(item) {
+    if (!item || !item.claim_expires_at || claimRemainingMs(item) <= 0) return "free";
+    return item.claim_token && claimTokens[item.id] === item.claim_token
+        ? "mine"
+        : "claimed";
+}
+
+async function claimRecord(id) {
+    const name = ensureReviewerName();
+    if (!name) return false;
+    const data = await api(`/api/matches/${id}/claim`, {
+        method: "POST",
+        body: JSON.stringify({ reviewer: name }),
+    });
+    claimTokens[id] = data.token;
+    saveClaimTokens();
+    return true;
+}
+
+async function releaseRecord(id, token) {
+    await api(`/api/matches/${id}/release`, {
+        method: "POST",
+        body: JSON.stringify({ token }),
+    });
+    delete claimTokens[id];
+    saveClaimTokens();
+}
+
+// Lease bar rendered above the action buttons of every pending record.
+function renderClaimBar(item) {
+    if (item.status !== "needs_review") return "";
+    const state = claimState(item);
+    if (state === "free") {
+        return `
+        <div class="claim-bar free" data-claim-id="${item.id}">
+            <span class="claim-state free">未领取</span>
+            <button class="tiny confirm btn-claim" type="button">🔒 领取十分钟租约</button>
+        </div>`;
+    }
+    const mine = state === "mine";
+    return `
+    <div class="claim-bar ${mine ? "mine" : "other"}" data-claim-id="${item.id}"
+         data-expires="${escapeHtml(item.claim_expires_at)}">
+        <span class="claim-state ${mine ? "mine" : "other"}">
+            ${mine ? "🔓 你已领取" : `🔒 由「${escapeHtml(item.claimed_by)}」领取`}
+        </span>
+        <span class="muted claim-expiry" title="租约到期时间 ${escapeHtml(item.claim_expires_at)}">
+            到期 ${fmtLeaseTime(item.claim_expires_at)}（剩余 <span class="claim-remain">…</span>）
+        </span>
+        ${mine ? `<button class="tiny reject btn-release" type="button">释放</button>`
+               : `<span class="muted">等待释放或租约到期后可领取</span>`}
+    </div>`;
+}
+
+function refreshClaimCountdowns() {
+    $$(".claim-bar[data-claim-id]").forEach((bar) => {
+        const remain = bar.querySelector(".claim-remain");
+        if (!remain) return;
+        const ms = new Date(bar.dataset.expires).getTime() - Date.now();
+        if (ms <= 0) {
+            remain.textContent = "已过期";
+            return;
+        }
+        const totalSec = Math.ceil(ms / 1000);
+        const mm = Math.floor(totalSec / 60);
+        const ss = String(totalSec % 60).padStart(2, "0");
+        remain.textContent = `${mm}分${ss}秒`;
+    });
+}
+
+setInterval(refreshClaimCountdowns, 1000);
+
 // ------------------------------------------------------------------- render
 
 function renderTokens(cand) {
@@ -130,6 +255,9 @@ function renderCandidate(cand, rank, opts = {}) {
     const actionAttrs = opts.reviewable
         ? `data-log="${opts.logId}" data-address="${a.id}"`
         : "";
+    // Records claimed by someone else show their candidates but cannot be
+    // reviewed from this browser until the lease is released or expires.
+    const disabledAttr = opts.reviewDisabled ? " disabled" : "";
     let ribbon = "";
     if (opts.consensusTargetId === a.id) {
         ribbon = `<span class="target-ribbon">共识指向</span>`;
@@ -153,8 +281,8 @@ function renderCandidate(cand, rank, opts = {}) {
         ${renderConflicts(cand.conflicts)}
         ${opts.reviewable ? `
         <div class="review-actions">
-            <button class="tiny confirm candidate-confirm" ${actionAttrs}>确认此候选</button>
-            ${rank !== 0 ? `<button class="tiny override candidate-override" ${actionAttrs}>改派为该候选</button>` : ""}
+            <button class="tiny confirm candidate-confirm" ${actionAttrs}${disabledAttrs}>确认此候选</button>
+            ${rank !== 0 ? `<button class="tiny override candidate-override" ${actionAttrs}${disabledAttrs}>改派为该候选</button>` : ""}
         </div>` : ""}
     </div>`;
 }
@@ -163,8 +291,17 @@ function renderResult(item, opts = {}) {
     const consensusTargetId = item.consensus && item.consensus.applied
         ? item.consensus.target_id
         : null;
+    // Fresh match results are not claimed; re-rendered review items may be.
+    const itemState = opts.reviewable ? claimState(item) : "free";
+    const canReview = opts.reviewable && itemState === "mine";
+    const reviewLocked = opts.reviewable && itemState === "claimed";
     const candidates = (item.candidates || [])
-        .map((c, i) => renderCandidate(c, i, { ...opts, consensusTargetId }))
+        .map((c, i) => renderCandidate(c, i, {
+            ...opts,
+            consensusTargetId,
+            logId: item.match_id,
+            reviewDisabled: opts.reviewable && !canReview,
+        }))
         .join("");
     return `
     <div class="result">
@@ -178,10 +315,14 @@ function renderResult(item, opts = {}) {
         <span class="muted">${escapeHtml(item.reason)}</span>
         ${renderConsensus(item.consensus)}
         ${item.runner_up_id ? `<div class="muted" style="margin-top:4px">次高分候选 #${item.runner_up_id}：${pct(item.runner_up_score)}（领先 ${pct((item.best_score ?? 0) - (item.runner_up_score ?? 0))}）</div>` : ""}
+        ${opts.reviewable ? renderClaimBar(item) : ""}
         ${candidates || '<div class="meta muted">标准地址表中没有任何候选</div>'}
         ${opts.reviewable && item.candidates.length > 0 ? `
         <div class="review-actions">
-            <button class="tiny reject candidate-reject" data-log="${item.match_id}">标记为无匹配</button>
+            <button class="tiny reject candidate-reject" data-log="${item.match_id}"${canReview ? "" : " disabled"}>标记为无匹配</button>
+            ${!canReview ? `<span class="muted">${reviewLocked
+                ? "该记录正被他人领取，暂不能复核"
+                : "请先领取该记录，领取后十分钟内可提交复核"}</span>` : ""}
         </div>` : ""}
     </div>`;
 }
@@ -210,6 +351,19 @@ $$(".tab").forEach((btn) => {
 
 $("#btn-demo").addEventListener("click", () => { $("#query").value = DEMO_QUERIES; });
 
+// Items currently rendered in #results (match tab), keyed by match_id, so
+// claim/release actions can refresh lease state without re-querying.
+let resultItems = [];
+
+function renderResultsList(items) {
+    resultItems = items;
+    $("#results").innerHTML = items
+        .map((item) => renderResult(item, {
+            reviewable: item.status === "needs_review",
+        }))
+        .join("");
+}
+
 $("#btn-match").addEventListener("click", async () => {
     const raw = $("#query").value.trim();
     if (!raw) return;
@@ -223,6 +377,7 @@ $("#btn-match").addEventListener("click", async () => {
                 method: "POST",
                 body: JSON.stringify({ query: queries[0], save: true }),
             });
+            resultItems = [item];
             $("#results").innerHTML = renderResult(item, {
                 reviewable: item.status === "needs_review",
             });
@@ -236,9 +391,7 @@ $("#btn-match").addEventListener("click", async () => {
             $("#match-summary").innerHTML =
                 `<span class="muted">共 ${s.total} 条：自动命中 ${s.auto_matched}，` +
                 `待确认 ${s.needs_review}，无匹配 ${s.no_match}</span>`;
-            $("#results").innerHTML = data.results
-                .map((item) => renderResult(item, { reviewable: item.status === "needs_review" }))
-                .join("");
+            renderResultsList(data.results);
         }
         refreshHealth();
         refreshGapsBadge();
@@ -250,31 +403,107 @@ $("#btn-match").addEventListener("click", async () => {
 });
 
 // Delegate review clicks from freshly rendered match results.
-$("#results").addEventListener("click", onReviewClick);
+$("#results").addEventListener("click", onResultActionClick);
 
 async function onReviewClick(event) {
     const btn = event.target.closest("button[data-log]");
-    if (!btn) return;
+    if (!btn || btn.disabled) return;
     const logId = Number(btn.dataset.log);
+    const token = claimTokens[logId];
+    if (!token) {
+        alert("请先领取该记录，再提交复核。");
+        return;
+    }
     let body;
     if (btn.classList.contains("candidate-reject")) {
-        body = { action: "rejected" };
+        body = { action: "rejected", token };
     } else {
         body = {
             action: btn.classList.contains("candidate-override") ? "overridden" : "confirmed",
             selected_id: Number(btn.dataset.address),
+            token,
         };
     }
     btn.disabled = true;
     try {
         await api(`/api/matches/${logId}/review`, { method: "POST", body: JSON.stringify(body) });
+        delete claimTokens[logId];
+        saveClaimTokens();
         btn.textContent = "✓ 已记录";
         btn.classList.add("confirm");
         await refreshHealth();
         refreshReplayBadge();
+        // If this card lives in the match-tab #results, refresh it to the
+        // reviewed state rather than leaving the "已记录" button behind.
+        if ($("#tab-match").classList.contains("active")) {
+            const card = $("#results").querySelector(
+                `[data-log="${logId}"]`)?.closest(".result");
+            if (card) await refreshResultCard(logId);
+        };
     } catch (err) {
         btn.disabled = false;
         alert(err.message);
+        // A 409 (expired/stale token, or state drift): refresh the card from
+        // the server so the buttons reflect the current occupancy.
+        if (/409|令牌|租约|领取|重复/.test(err.message)) {
+            refreshResultCard(logId);
+        }
+    }
+}
+
+// Re-fetch one record (used after a lease 409) and re-render its result card.
+async function refreshResultCard(logId) {
+    try {
+        const item = await api(`/api/matches/${logId}`);
+        // Match results need the normalized block; recover it from the cache.
+        const cached = resultItems.find((it) => it.match_id === logId);
+        const merged = cached && cached.normalized
+            ? { ...cached, ...item }
+            : item;
+        resultItems = resultItems.map((it) =>
+            it.match_id === logId ? merged : it);
+        const cards = $$("#results .result");
+        // Cards render in the same order as resultItems.
+        const idx = resultItems.findIndex((it) => it.match_id === logId);
+        if (cards[idx]) {
+            const wrapper = document.createElement("div");
+            wrapper.innerHTML = renderResult(merged, {
+                reviewable: item.status === "needs_review",
+            });
+            cards[idx].replaceWith(wrapper.firstElementChild);
+        }
+    } catch (err) {
+        // best effort
+    }
+}
+
+// Claim / release buttons inside rendered match-result cards.
+async function onResultActionClick(event) {
+    const claimBtn = event.target.closest(".btn-claim");
+    const releaseBtn = event.target.closest(".btn-release");
+    if (!claimBtn && !releaseBtn) {
+        await onReviewClick(event);
+        return;
+    }
+    const bar = event.target.closest(".claim-bar");
+    const logId = Number(bar.dataset.claimId);
+    const btn = claimBtn || releaseBtn;
+    btn.disabled = true;
+    try {
+        if (claimBtn) {
+            const ok = await claimRecord(logId);
+            if (!ok) {
+                btn.disabled = false;
+                return;
+            }
+        } else {
+            await releaseRecord(logId, claimTokens[logId]);
+        }
+        await refreshResultCard(logId);
+    } catch (err) {
+        btn.disabled = false;
+        alert(err.message);
+        await refreshResultCard(logId);
     }
 }
 
@@ -611,9 +840,14 @@ async function loadReview() {
             const consensusTargetId = item.consensus && item.consensus.applied
                 ? item.consensus.target_id
                 : null;
+            const pending = item.status === "needs_review";
+            const state = pending ? claimState(item) : "free";
+            const canReview = pending && state === "mine";
+            const heldByOther = pending && state === "claimed";
             const candidateHtml = item.candidates.length
                 ? item.candidates.map((c, i) => renderCandidate(c, i, {
-                    reviewable: item.status === "needs_review",
+                    reviewable: pending,
+                    reviewDisabled: !canReview,
                     logId: item.id,
                     consensusTargetId,
                 })).join("")
@@ -625,10 +859,14 @@ async function loadReview() {
                 <span class="status ${item.status}">${STATUS_LABEL[item.status] || item.status}</span>
                 ${item.review_action ? `<span class="muted">复核动作：${escapeHtml(item.review_action)}</span>` : ""}
                 ${renderConsensus(item.consensus)}
+                ${pending ? renderClaimBar(item) : ""}
                 ${candidateHtml}
-                ${item.status === "needs_review" ? `
+                ${pending ? `
                 <div class="review-actions">
-                    <button class="tiny reject candidate-reject" data-log="${item.id}">标记为无匹配</button>
+                    <button class="tiny reject candidate-reject" data-log="${item.id}"${canReview ? "" : " disabled"}>标记为无匹配</button>
+                    ${!canReview ? `<span class="muted">${heldByOther
+                        ? "该记录正被他人领取，暂不能复核"
+                        : "请先领取该记录，领取后十分钟内可提交复核"}</span>` : ""}
                 </div>` : ""}
             </div>`;
         }).join("");
@@ -639,7 +877,40 @@ async function loadReview() {
 
 $("#btn-refresh-review").addEventListener("click", loadReview);
 $("#review-filter").addEventListener("change", loadReview);
+
+// Reviewer name persists between reloads.
+(function initReviewerName() {
+    const saved = localStorage.getItem("reviewerName");
+    if (saved) $("#reviewer-name").value = saved;
+    $("#reviewer-name").addEventListener("change", (event) => {
+        localStorage.setItem("reviewerName", event.target.value.trim());
+    });
+})();
+
 $("#review-list").addEventListener("click", async (event) => {
+    const claimBtn = event.target.closest(".btn-claim");
+    const releaseBtn = event.target.closest(".btn-release");
+    if (claimBtn || releaseBtn) {
+        const bar = event.target.closest(".claim-bar");
+        const logId = Number(bar.dataset.claimId);
+        const btn = claimBtn || releaseBtn;
+        btn.disabled = true;
+        try {
+            if (claimBtn) {
+                const ok = await claimRecord(logId);
+                if (!ok) {
+                    btn.disabled = false;
+                    return;
+                }
+            } else {
+                await releaseRecord(logId, claimTokens[logId]);
+            }
+        } catch (err) {
+            alert(err.message);
+        }
+        loadReview();
+        return;
+    }
     await onReviewClick(event);
     if (event.target.closest("button[data-log]")) loadReview();
 });
@@ -653,6 +924,10 @@ function renderGroup(group) {
     const queries = group.queries.map((m) => `
         <div class="gq">🔍 ${escapeHtml(m.query)}
             <span class="muted">记录 #${m.id}</span>
+            ${m.claimed_by ? `
+            <span class="group-claim" title="租约到期 ${escapeHtml(m.claim_expires_at || "")}">
+                🔒 由「${escapeHtml(m.claimed_by)}」领取至 ${fmtLeaseTime(m.claim_expires_at)}
+            </span>` : ""}
         </div>`).join("");
     const candidates = group.candidates
         .map((c, i) => renderCandidate(c, i, {}))
@@ -661,6 +936,14 @@ function renderGroup(group) {
     const options = group.candidates.map((c) =>
         `<option value="${c.address.id}">#${c.address.id} · ${pct(c.score)} · ` +
         `${escapeHtml(c.address.full_text)}</option>`).join("");
+    const claimed = group.claimed_members || [];
+    const groupWarn = claimed.length ? `
+        <div class="group-claim-warn">
+            ⛔ 组内有 ${claimed.length} 条记录仍被领取，整组复核将被服务端拒绝（避免绕过占用）：
+            ${claimed.map((c) =>
+                `#${c.match_id}「${escapeHtml(c.claimed_by)}」至 ${fmtLeaseTime(c.claim_expires_at)}`
+            ).join("；")}
+        </div>` : "";
     return `
     <div class="review-group" data-group="${escapeHtml(group.group_key)}">
         <div class="group-head">
@@ -672,6 +955,7 @@ function renderGroup(group) {
             </span>
         </div>
         <div class="group-queries">${queries}</div>
+        ${groupWarn}
         ${candidates}
         <div class="review-actions">
             ${best ? `<button class="tiny confirm group-action" data-action="confirmed">
@@ -715,6 +999,23 @@ $("#review-groups").addEventListener("click", async (event) => {
     const body = { group_key: key, match_ids: group.match_ids, action };
     if (action === "overridden") {
         body.selected_id = Number(card.querySelector(".group-select").value);
+    }
+    // UX guard: live leases mean the server will reject the whole group.
+    const claimed = group.claimed_members || [];
+    if (claimed.length) {
+        const stillLive = claimed.filter((c) =>
+            new Date(c.claim_expires_at).getTime() > Date.now());
+        if (stillLive.length) {
+            alert(
+                "组内有记录仍被领取，整组复核将被整体拒绝：\n" +
+                stillLive.map((c) =>
+                    `#${c.match_id} 由「${c.claimed_by}」领取至 ${fmtLeaseTime(c.claim_expires_at)}`
+                ).join("\n") +
+                "\n\n请等待租约释放或到期后再操作。"
+            );
+            loadReview();
+            return;
+        }
     }
     btn.disabled = true;
     try {

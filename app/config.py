@@ -36,6 +36,9 @@ class Settings:
     token_weight: float
     host: str
     port: int
+    # Manual review claims (leases) live this long; an expired lease frees the
+    # record for anyone else to claim.  Overridable for tests/deployments.
+    review_lease_seconds: int
 
     @property
     def db_url(self) -> str:
@@ -57,4 +60,5 @@ def get_settings() -> Settings:
         token_weight=_env_float("TOKEN_WEIGHT", 0.7),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
+        review_lease_seconds=int(os.getenv("REVIEW_LEASE_SECONDS", "600")),
     )

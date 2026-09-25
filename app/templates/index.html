@@ -131,7 +131,12 @@
     <section id="tab-review" class="panel">
         <div class="card">
             <h2>待确认队列</h2>
-            <div class="row">
+            <div class="row wrap">
+                <label class="claim-name-field">
+                    复核员姓名：
+                    <input type="text" id="reviewer-name" maxlength="64"
+                           placeholder="输入姓名后可领取待确认记录" autocomplete="off">
+                </label>
                 <select id="review-filter">
                     <option value="needs_review">仅待确认</option>
                     <option value="">全部记录</option>
@@ -141,6 +146,12 @@
                 </select>
                 <button id="btn-refresh-review" class="ghost">刷新</button>
             </div>
+            <p class="hint">
+                待确认记录需先<b>领取</b>（以当前姓名换取十分钟有效的唯一租约）后才能提交复核：
+                同一时刻一条记录只允许一个有效令牌，租约到期后他人可重新领取；
+                过期令牌、旧令牌与重复提交都会被服务端以 409 拒绝。
+                同案整组复核遇到仍被领取的成员时会整体拒绝。
+            </p>
             <div id="review-groups"></div>
             <div id="review-list"></div>
         </div>

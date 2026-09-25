@@ -155,12 +155,21 @@ def test_batch_and_review_flow(client):
     ids = [item["id"] for item in r.json()["items"]]
     assert log_id in ids
 
-    # confirm the system's preferred candidate
+    # a review without a claim token is refused (409) and writes nothing
     r = client.post(f"/api/matches/{log_id}/review", json={"action": "confirmed"})
+    assert r.status_code == 409
+    assert client.get(f"/api/matches/{log_id}").json()["status"] == "needs_review"
+
+    # claim the record, then confirm the system's preferred candidate
+    token = _claim(client, log_id, "alice")
+    r = client.post(f"/api/matches/{log_id}/review",
+                    json={"action": "confirmed", "token": token})
     assert r.status_code == 200
     r = client.get(f"/api/matches/{log_id}")
     assert r.json()["status"] == "reviewed"
     assert r.json()["review_action"] == "confirmed"
+    # a successful review consumes the lease
+    assert r.json()["claimed_by"] is None
 
 
 def test_override_review(client):
@@ -168,8 +177,10 @@ def test_override_review(client):
     log_id = r.json()["match_id"]
     candidates = r.json()["candidates"]
     second = candidates[1]["address"]["id"]
+    token = _claim(client, log_id, "bob")
     r = client.post(f"/api/matches/{log_id}/review",
-                    json={"action": "overridden", "selected_id": second})
+                    json={"action": "overridden", "selected_id": second,
+                          "token": token})
     assert r.status_code == 200
     detail = client.get(f"/api/matches/{log_id}").json()
     assert detail["review_action"] == "overridden"
@@ -377,6 +388,26 @@ def _match_pending(client, query: str) -> int:
     return data["match_id"]
 
 
+def _claim(client, match_id: int, reviewer: str = "tester") -> str:
+    r = client.post(f"/api/matches/{match_id}/claim", json={"reviewer": reviewer})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["token"]
+    assert data["claimed_by"] == reviewer
+    return data["token"]
+
+
+def _review_with_claim(client, match_id: int, action: str = "confirmed",
+                       selected_id: int | None = None,
+                       reviewer: str = "tester") -> None:
+    token = _claim(client, match_id, reviewer)
+    body: dict = {"action": action, "token": token}
+    if selected_id is not None:
+        body["selected_id"] = selected_id
+    r = client.post(f"/api/matches/{match_id}/review", json=body)
+    assert r.status_code == 200, r.text
+
+
 def _group_by_house(client, house: str) -> dict:
     r = client.get("/api/review-groups")
     assert r.status_code == 200
@@ -473,8 +504,7 @@ def test_review_group_member_reviewed_individually_conflicts(client):
     g = _group_by_house(client, "302")
 
     # one member gets reviewed through the original single-record endpoint
-    r = client.post(f"/api/matches/{ids[0]}/review", json={"action": "rejected"})
-    assert r.status_code == 200
+    _review_with_claim(client, ids[0], "rejected")
 
     # the group review now conflicts and writes nothing at all
     r = client.post("/api/review-groups/review", json={
@@ -544,8 +574,7 @@ def _seed_two_confirms(client, query_a: str, query_b: str) -> int:
         ids.append(data["match_id"])
         target_id = data["best_id"]
     for mid in ids:
-        r = client.post(f"/api/matches/{mid}/review", json={"action": "confirmed"})
-        assert r.status_code == 200
+        _review_with_claim(client, mid, "confirmed")
     assert target_id is not None
     return target_id
 
@@ -579,7 +608,7 @@ def test_consensus_auto_applies_after_two_confirms(client):
 
 def test_consensus_single_record_is_insufficient(client):
     mid = _match_pending(client, "1011 Lake Dr, Austin TX")
-    client.post(f"/api/matches/{mid}/review", json={"action": "confirmed"})
+    _review_with_claim(client, mid, "confirmed")
 
     data = client.post("/api/match", json={"query": "1011 Lake Dr, Austin TX"}).json()
     assert data["status"] == "needs_review"
@@ -591,9 +620,9 @@ def test_consensus_single_record_is_insufficient(client):
 
 def test_consensus_blocked_by_rejection(client):
     mid_yes = _match_pending(client, "1012 Lake Dr, Austin TX")
-    client.post(f"/api/matches/{mid_yes}/review", json={"action": "confirmed"})
+    _review_with_claim(client, mid_yes, "confirmed")
     mid_no = _match_pending(client, "No. 1012 Lake Dr, Austin TX")
-    client.post(f"/api/matches/{mid_no}/review", json={"action": "rejected"})
+    _review_with_claim(client, mid_no, "rejected")
 
     data = client.post("/api/match", json={"query": "1012 LAKE DR, AUSTIN TX"}).json()
     # one rejection poisons the bucket even with another confirmation present
@@ -613,9 +642,8 @@ def test_consensus_blocked_by_conflicting_targets(client):
     mid_a = first["match_id"]
     mid_b = client.post("/api/match",
                         json={"query": "No. 1017 Lake Dr, Austin TX"}).json()["match_id"]
-    client.post(f"/api/matches/{mid_a}/review", json={"action": "confirmed"})
-    client.post(f"/api/matches/{mid_b}/review",
-                json={"action": "overridden", "selected_id": target_b})
+    _review_with_claim(client, mid_a, "confirmed")
+    _review_with_claim(client, mid_b, "overridden", target_b)
 
     data = client.post("/api/match", json={"query": "1017 LAKE DR, AUSTIN TX"}).json()
     assert data["status"] == "needs_review"
@@ -633,12 +661,12 @@ def test_consensus_takes_effect_immediately_and_does_not_rewrite(client):
     assert before["status"] == "needs_review"
     assert before["consensus"]["state"] == "insufficient"
 
-    client.post(f"/api/matches/{mid_a}/review", json={"action": "confirmed"})
+    _review_with_claim(client, mid_a, "confirmed")
     # still just one -> insufficient
     one = client.post("/api/match", json={"query": "1014 Lake Drive, Austin TX"}).json()
     assert one["consensus"]["state"] == "insufficient"
 
-    client.post(f"/api/matches/{mid_b}/review", json={"action": "confirmed"})
+    _review_with_claim(client, mid_b, "confirmed")
     # new reviews take effect immediately
     after = client.post("/api/match", json={"query": "1014 LAKE DR, AUSTIN TX"}).json()
     assert after["status"] == "auto_matched"

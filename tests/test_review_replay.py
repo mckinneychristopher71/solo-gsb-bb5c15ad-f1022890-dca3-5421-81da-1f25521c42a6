@@ -25,11 +25,47 @@ def _match_save(client, query: str) -> dict:
 
 
 def _review(client, match_id: int, action: str, selected_id: int | None = None) -> None:
-    body: dict = {"action": action}
-    if selected_id is not None:
-        body["selected_id"] = selected_id
-    r = client.post(f"/api/matches/{match_id}/review", json=body)
-    assert r.status_code == 200, r.text
+    """Write a verdict exactly like the review endpoint, bypassing the lease.
+
+    Replay fixtures deliberately include reviewed ``auto_matched`` /
+    ``no_match`` logs (records that can never be pending), so they are written
+    directly through the persistence layer instead of the claim-guarded API.
+    """
+    import json
+
+    conn = get_conn()
+    row = db.get_match_log(conn, match_id)
+    assert row is not None
+    score: float | None = None
+    selected_text: str | None = None
+    if action == "overridden":
+        target = db.get_address(conn, selected_id)
+        selected_text = target["full_text"]
+        for cand in json.loads(row["candidates_json"]):
+            if cand["address"]["id"] == selected_id:
+                score = cand["score"]
+                break
+    elif action == "confirmed":
+        selected_id = row["candidate_id"]
+        score = row["score"]
+        if row["candidate_id"] is not None:
+            chosen = db.get_address(conn, row["candidate_id"])
+            selected_text = (
+                chosen["full_text"] if chosen is not None
+                else next(
+                    (c["address"]["full_text"]
+                     for c in json.loads(row["candidates_json"])
+                     if c["address"]["id"] == row["candidate_id"]),
+                    None,
+                )
+            )
+    else:
+        selected_id = None
+    with db.transaction(conn):
+        db.review_match_log(
+            conn, match_id, action=action, selected_id=selected_id,
+            score=score, selected_text=selected_text,
+        )
 
 
 def _replay(client, category: str | None = None) -> dict:

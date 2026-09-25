@@ -6,7 +6,7 @@
 过小的候选会被标记为 **待确认（needs_review）**，并在界面上展示命中词元、冲突字段与
 可复核结果。
 
-- 🌐 网页界面：单条/批量匹配、**规则 A/B 对照实验**、上传标准地址 CSV、待确认队列人工复核（含同案合并复核、复核共识记忆）、**地址覆盖缺口清单**
+- 🌐 网页界面：单条/批量匹配、**规则 A/B 对照实验**、上传标准地址 CSV、待确认队列人工复核（含**人工领取租约**、同案合并复核、复核共识记忆）、**地址覆盖缺口清单**
 - 🔬 **导入影响预演**：CSV 预览确认前，把本次**有效待导入行**按正式导入的同款行规范化生成临时地址（以 CSV 行号标识、只在内存中），对**按日志时间倒序取出的最近 100 个不同原始查询**，分别用当前地址表与临时合并表沿现有匹配及复核共识逻辑重跑，逐条对比前后状态与自动命中目标，按 **改善 / 退化 / 目标改派 / 不变** 分类汇总；无效及重复行不参与，预演不写入地址和匹配日志，确认导入仍走原有文件校验与事务
 - 🕳️ **地址覆盖缺口**：从已保存且状态为 `no_match` 的匹配日志生成缺口清单，按归一化后的**道路词元 + 地区词元 + 门牌号**归组（门牌号不同不算同一缺口），展示出现次数、原始查询示例与最近出现时间；每次打开清单都用**当前标准地址表与默认规则**重跑每组代表查询——现已能自动命中的组标为**已覆盖**并显示命中地址，其余标为**待补录**并显示当前首选候选，避免上传地址后仍把旧拒绝记录当作未解决。支持待补录 / 已覆盖筛选，全程只读、不写日志
 - 🩺 **标准地址自匹配巡检**：对当前表每条标准地址，以其全文作为查询、按默认规则在**完整地址表**上重新评分，只列出**未能自动命中自身 ID** 的记录。每条风险给出自身分数与所有得分不低于「自身分数 − 默认分差阈值」的其他地址（阻碍候选，**不受前五候选截断**），并按 **自身分数不足 / 首选偏移 / 分差歧义** 分类汇总；上传新表后刷新即重新计算，全程只读、不写日志
@@ -17,6 +17,7 @@
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
 - 👥 同案合并复核：归一化后道路/地区词元与门牌号一致、且候选（ID/顺序/得分）完全相同的待确认记录自动归组，可整组确认首选、改派共同候选或判无匹配；整组写入在单个 SQLite 写事务内完成，组成员或签名有变化即整体冲突回滚
+- 🔒 **人工复核领取（十分钟租约）**：待确认记录须先由复核员输入姓名**领取**，获得十分钟内有效的唯一令牌；领取与释放均在 SQLite 写事务内完成，同一时刻一条记录只允许一个有效令牌，租约过期后任何人可重新领取。单条复核必须携带令牌，服务端在**同一事务内**核验租约（存在、未过期、令牌一致）与待确认状态后才写入结论——**过期令牌、旧令牌（被新租约取代）、无令牌与重复提交一律返回 `409`**。同案整组复核遇到仍被领取（租约未过期）的成员时**整体拒绝**（`409`），不能借整组提交绕过个人占用。待办列表展示领取人、到期时间（含剩余倒计时）并提供领取 / 释放操作；TTL 可用环境变量 `REVIEW_LEASE_SECONDS` 调整（默认 600 秒）
 - 🧠 **复核共识记忆**：单条与批量匹配照常评分；当同一归一化道路词元 + 地区词元 + 门牌号下已有 **至少 2 条已复核记录**、且全部一致确认同一个仍然有效的标准地址（无拒绝、无不同结论）时，新的待确认结果自动指向该地址；目标不在本次候选中或历史结论冲突时保持原判并返回原因。新复核即时生效，旧记录不回写；页面展示共识命中状态与证据条数
 
 ---
@@ -37,6 +38,7 @@ docker compose up --build
 | 导入影响预演 API（`{token}` 为预览凭证） | http://localhost:8000/api/addresses/preview/{token}/impact |
 | REST API 文档（Swagger） | http://localhost:8000/docs |
 | 健康检查 | http://localhost:8000/api/health |
+| 待确认队列（含领取信息） | http://localhost:8000/api/matches?status=needs_review |
 
 打开 **http://localhost:8000** 后，点击顶部 **「地址覆盖缺口」** 标签即可查看缺口清单，
 点击 **「自匹配巡检」** 标签即可查看标准地址自匹配巡检结果，
@@ -50,6 +52,7 @@ docker compose up --build
 - **必要配置**：开箱无需任何配置；`docker-compose.yml` 中的 `AUTO_THRESHOLD` / `MARGIN_THRESHOLD` /
   `REJECT_THRESHOLD` / `TOKEN_WEIGHT` 环境变量仅作为常规匹配的默认值与网页实验表单的预填值，
   A/B 实验中每档参数都可在请求里单独覆盖，无需重建镜像
+- **复核租约时长**：默认十分钟，可用环境变量 `REVIEW_LEASE_SECONDS`（秒）调整，无需重建镜像
 
 不用 Docker 时：
 
@@ -384,9 +387,11 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
    阈值均可通过环境变量调整：`AUTO_THRESHOLD`、`MARGIN_THRESHOLD`、
    `REJECT_THRESHOLD`、`TOKEN_WEIGHT`。
 
-5. **人工复核**：待确认记录可在网页「待确认队列」或通过
-   `POST /api/matches/{id}/review` 执行 `confirmed`（确认首选）、
-   `overridden`（改派为其他候选，带 `selected_id`）、`rejected`（标记无匹配）。
+5. **人工复核（先领取、令牌随行）**：待确认记录在网页「待确认队列」或通过 API 复核前，
+   复核员须先输入姓名**领取**该记录，拿到十分钟（默认 `REVIEW_LEASE_SECONDS=600`）内
+   有效的唯一令牌，再对 `POST /api/matches/{id}/review` 提交
+   `confirmed`（确认首选）、`overridden`（改派为其他候选，带 `selected_id`）、
+   `rejected`（标记无匹配），请求体必须带 `token`。详见下节「人工复核领取租约」。
 
 6. **同案合并复核**（`app/review_groups.py`）
    - **归组规则**：待确认记录按查询归一化后的 **道路词元 + 地区词元 + 门牌号**
@@ -463,6 +468,56 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
      }
    }
    ```
+
+---
+
+## 人工复核领取租约
+
+为避免两名复核员同时处理同一条待确认记录（互相覆盖结论），单条复核采用**领取租约**：
+
+- **领取**：复核员输入自己的姓名，调用 `POST /api/matches/{id}/claim`
+  （`{"reviewer": "张三"}`），服务端在 `BEGIN IMMEDIATE` 写事务内核对记录仍为
+  待确认且没有他人未过期的租约，然后写入唯一一行租约（`review_claims.match_id`
+  即主键，天然保证同一时刻只有一个有效令牌），返回不透明 `token`、`claimed_by`、
+  `claimed_at`、`expires_at` 与 `lease_seconds`。租约默认 **10 分钟**，可用
+  `REVIEW_LEASE_SECONDS` 调整。
+- **单令牌与过期重领**：租约未过期时他人再次领取返回 `409`（并提示当前领取人）；
+  过期后该行可被新的领取覆盖，新领取产生**新的令牌**。
+- **携带令牌复核**：`POST /api/matches/{id}/review` 的请求体必须带 `token`。
+  服务端在**同一个写事务内**依次核验：记录仍为 `needs_review`、租约存在、未过期、
+  令牌与当前租约一致，然后才写入复核结论并在**同事务内删除租约**。
+  - 无令牌 / 租约不存在 → `409`（请先领取）；
+  - 租约已过期 → `409`（请重新领取）；
+  - 令牌与当前有效租约不一致（旧令牌、被他人重新领取）→ `409`；
+  - 记录已复核（重复提交）→ `409`。任何失败都整体回滚，一条结论也不写。
+- **释放**：`POST /api/matches/{id}/release`（`{"token": "…"}`）提前归还；
+  只有当前持有者的有效令牌能释放，他人令牌返回 `409`；记录已无租约时调用幂等成功。
+- **整组复核不得绕过占用**：`POST /api/review-groups/review` 在其写事务内检查每一位
+  成员是否仍被领取，只要有一条未过期租约，整组返回 `409` 并列出被占用的成员，
+  **一条也不写入**；全部释放或租约到期后方可整组复核。
+- **待办列表**：`GET /api/matches?status=needs_review` 的每条待确认记录都带
+  `claimed_by` / `claim_expires_at`（无有效租约时为 `null`）；同案分组
+  `GET /api/review-groups` 的每位成员与 `claimed_members` 同样带领取人与到期时间。
+  网页「待确认队列」在顶部输入复核员姓名后，可对记录执行**领取 / 释放**，卡片显示
+  领取人、到期时间与剩余倒计时；已被他人领取的记录，其复核按钮在界面上禁用
+  （服务端同样强制拒绝）。
+
+```bash
+# 1) 领取待确认记录（姓名换取十分钟令牌）
+curl -s -X POST http://localhost:8000/api/matches/12/claim \
+  -H 'Content-Type: application/json' -d '{"reviewer": "张三"}'
+# => {"match_id":12,"token":"Ab3…Zq","claimed_by":"张三",
+#     "claimed_at":"…","expires_at":"…","lease_seconds":600}
+
+# 2) 带令牌提交复核（无令牌 / 过期 / 旧令牌 / 重复提交均为 409）
+curl -s -X POST http://localhost:8000/api/matches/12/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "confirmed", "token": "Ab3…Zq"}'
+
+# 3) 或提前主动释放
+curl -s -X POST http://localhost:8000/api/matches/12/release \
+  -H 'Content-Type: application/json' -d '{"token": "Ab3…Zq"}'
+```
 
 ---
 
@@ -665,11 +720,13 @@ curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 | GET | `/api/experiments` | 历史实验列表（编号、档案、查询数、各档计数与不一致数） |
 | GET | `/api/experiments/{id}` | 按实验编号回看完整结果（档案、查询、快照、逐档结果与候选差异） |
 | POST | `/api/experiments/compare` | 历史回归对比：两次已持久化实验按档案名 + 去空白查询对齐，逐单元分类 改善/退化/仅分数变化/无变化 并汇总；缺失档案/重复查询逐项报错（400），实验不存在 404；快照 digest 不同标记不可直接比较但仍返回逐条差异 |
-| GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列 |
-| GET | `/api/matches/{id}` | 单条匹配详情 |
-| POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected |
-| GET | `/api/review-groups` | 待确认记录的同案分组（归一化键 + 候选签名归组，含组内原始查询与数量） |
-| POST | `/api/review-groups/review` | 整组复核：单事务核对组签名与成员集合，冲突返回 409 且一条不写 |
+| GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列（待确认记录附带 `claimed_by` / `claim_expires_at` / `claim_token` 领取信息，无有效租约时为 `null`） |
+| GET | `/api/matches/{id}` | 单条匹配详情（同样附带当前领取信息） |
+| POST | `/api/matches/{id}/claim` | 领取待确认记录：`{"reviewer": "姓名"}` → 十分钟有效的唯一租约令牌；记录非待确认或仍被他人占用返回 409 |
+| POST | `/api/matches/{id}/release` | 释放租约：`{"token": "…"}`，仅当前持有者的有效令牌可释放；他人令牌返回 409，无租约时幂等成功 |
+| POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected，**必须携带领取令牌 `token`**；无令牌 / 过期 / 旧令牌 / 重复提交均返回 409，核验与写入在同一 SQLite 事务内 |
+| GET | `/api/review-groups` | 待确认记录的同案分组（归一化键 + 候选签名归组，含组内原始查询、数量及每位成员的领取人/到期时间 `claimed_members`） |
+| POST | `/api/review-groups/review` | 整组复核：单事务核对组签名与成员集合，冲突返回 409 且一条不写；**组内存在仍被领取（未过期）的成员时整体 409 拒绝** |
 | GET | `/api/review-replay?category=…` | 复核结论回放：已复核记录以原查询在当前地址表上按默认规则重跑并对照人工结论，分为 一致(consistent)/冲突(conflict)/漏命中(missed)/误命中(false_hit)/原选择未知(unknown)；原 ID、全文与复核得分取自复核写入时持久保存的地址快照（不随地址删除消失），按当前地址表标注是否已删除；只读不写 |
 | GET | `/api/coverage-gaps?status=open` | 地址覆盖缺口：`no_match` 日志按归一化道路/地区词元 + 门牌号归组，每次调用用当前地址表与默认规则重跑代表查询，标记 待补录(open)/已覆盖(covered)；只读不写 |
 | GET | `/api/address-audit?category=…` | 标准地址自匹配巡检：每条标准地址以其全文按默认规则在完整地址表上评分，只列出未自动命中自身 ID 的记录，含自身分数与得分 ≥ 自身分数 − 默认分差阈值的全部阻碍候选（不受前五截断），按 自身分数不足(self_score_low)/首选偏移(best_drifted)/分差歧义(margin_ambiguous) 分类汇总；只读不写 |
@@ -716,6 +773,7 @@ curl -s 'http://localhost:8000/api/review-replay?category=conflict'
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
 │   ├── experiments.py     # 规则 A/B 对照实验：逐档运行、差异分析与持久化；历史回归对比（对齐/分类/汇总）
 │   ├── consensus.py       # 复核共识记忆：历史复核聚合与自动指向
+│   ├── review_claims.py   # 人工复核领取：十分钟租约、令牌事务核验、整组占用拦截
 │   ├── review_groups.py   # 同案合并复核：归组与整组事务写入
 │   ├── review_replay.py   # 复核结论回放：已复核记录按当前表/默认规则重跑并对照分类（只读）
 │   ├── coverage_gaps.py   # 地址覆盖缺口：no_match 日志归组 + 当前表/默认规则实时重跑（只读）

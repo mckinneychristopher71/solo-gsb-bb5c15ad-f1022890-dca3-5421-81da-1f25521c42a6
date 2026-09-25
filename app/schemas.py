@@ -48,6 +48,19 @@ class AddressBatchIn(BaseModel):
 class ReviewAction(BaseModel):
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+    # Single-record reviews must present the live claim token handed out by
+    # POST /api/matches/{id}/claim; stale/expired/missing tokens -> 409.
+    token: str | None = None
+
+
+class ReviewClaimIn(BaseModel):
+    """领取待确认记录：复核员姓名，换取十分钟租约令牌。"""
+    reviewer: constr(strip_whitespace=True, min_length=1, max_length=64)
+
+
+class ReviewReleaseIn(BaseModel):
+    """主动释放自己持有的领取租约。"""
+    token: str = Field(..., min_length=1)
 
 
 class GroupReviewAction(BaseModel):
