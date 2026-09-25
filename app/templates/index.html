@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>地址匹配 · Address Matcher</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+    <h1>地址匹配台 <span class="sub">Address Matcher</span></h1>
+    <div class="health">
+        <span id="health" class="badge">连接中…</span>
+        <a href="/docs" target="_blank" class="link">REST API 文档</a>
+    </div>
+</header>
+
+<nav class="tabs">
+    <button class="tab" data-tab="match">单条 / 批量匹配</button>
+    <button class="tab" data-tab="experiment">规则 A/B 实验</button>
+    <button class="tab" data-tab="table">标准地址表 <span id="addr-count" class="count"></span></button>
+    <button class="tab" data-tab="review">待确认队列 <span id="review-count" class="count"></span></button>
+    <button class="tab" data-tab="replay">复核回放 <span id="replay-count" class="count"></span></button>
+    <button class="tab" data-tab="gaps">地址覆盖缺口 <span id="gaps-count" class="count"></span></button>
+    <button class="tab" data-tab="audit">自匹配巡检 <span id="audit-count" class="count"></span></button>
+</nav>
+
+<main>
+    <!-- ============================ matching ============================ -->
+    <section id="tab-match" class="panel active">
+        <div class="card">
+            <h2>外部地址输入</h2>
+            <p class="hint">每行一条地址；或直接粘贴一条。系统会自动统一 Unicode、大小写、道路缩写与门牌号格式。</p>
+            <textarea id="query" rows="4"
+                placeholder="例如：123 main street, New York, NY 10001"></textarea>
+            <div class="row">
+                <button id="btn-match" class="primary">开始匹配</button>
+                <button id="btn-demo" class="ghost">填充示例</button>
+                <span id="match-summary"></span>
+            </div>
+        </div>
+        <div id="results"></div>
+    </section>
+
+    <!-- ====================== rule A/B experiments ===================== -->
+    <section id="tab-experiment" class="panel">
+        <div class="card">
+            <h2>规则 A/B 对照实验</h2>
+            <p class="hint">
+                提交 2~4 个命名规则档案（自动命中 / 拒绝 / 分差阈值与词元权重）和 1~100 条查询，
+                服务端在<b>同一标准地址表快照</b>下逐档运行现有匹配器。档案参数非法或查询重复时逐项报错且不执行；
+                结果持久化，可按实验编号回看。
+            </p>
+            <div id="ab-profiles" class="ab-profiles"></div>
+            <div class="row">
+                <button id="btn-ab-add" class="ghost">＋ 增加一档（最多 4 档）</button>
+            </div>
+            <h2 class="ab-subtitle">实验查询</h2>
+            <textarea id="ab-queries" rows="4"
+                placeholder="每行一条查询，1~100 条，不可完全重复"></textarea>
+            <div class="row">
+                <button id="btn-ab-run" class="primary">开始对照实验</button>
+                <button id="btn-ab-demo" class="ghost">填充示例</button>
+                <span id="ab-run-summary"></span>
+            </div>
+            <div id="ab-errors"></div>
+        </div>
+        <div id="ab-result"></div>
+        <div class="card" id="ab-history-card">
+            <h2>历史实验</h2>
+            <div class="row">
+                <button id="btn-ab-refresh-history" class="ghost">刷新历史</button>
+                <span class="hint">点击编号回看完整结果；「→基准 / →对比」可直接填入下方回归对比</span>
+            </div>
+            <div id="ab-history"></div>
+        </div>
+        <div class="card" id="cmp-card">
+            <h2>历史回归对比</h2>
+            <p class="hint">
+                选择两次已持久化的实验，服务端按<b>档案名称</b>与<b>去首尾空白后的查询</b>逐档对齐，
+                比较状态 / 首选地址 / 得分变化并分类为 改善 / 退化 / 仅分数变化 / 无变化。
+                档案缺失或查询重复的实验会被拒绝对比；地址表快照 digest 不同时提示不可直接比较，但仍展示逐条差异。
+            </p>
+            <div class="row wrap cmp-selectors">
+                <label class="cmp-sel">
+                    <span>基准实验（旧）</span>
+                    <select id="cmp-base"></select>
+                </label>
+                <button id="btn-cmp-swap" class="ghost" title="交换基准与对比实验">⇄ 交换</button>
+                <label class="cmp-sel">
+                    <span>对比实验（新）</span>
+                    <select id="cmp-target"></select>
+                </label>
+                <button id="btn-cmp-run" class="primary">开始对比</button>
+            </div>
+            <div id="cmp-errors"></div>
+            <div id="cmp-result"></div>
+        </div>
+    </section>
+
+    <!-- ====================== standard address table =================== -->
+    <section id="tab-table" class="panel">
+        <div class="card">
+            <h2>标准地址表</h2>
+            <div class="row wrap">
+                <input type="file" id="csv-file" accept=".csv" class="hidden-file">
+                <label for="csv-file" class="btn ghost-file">选择 CSV 文件</label>
+                <label class="inline-check">
+                    <input type="checkbox" id="csv-preview-mode" checked>
+                    上传前先预览确认
+                </label>
+                <button id="btn-sample" class="ghost">加载内置示例数据</button>
+                <button id="btn-refresh-table" class="ghost">刷新</button>
+                <span id="table-msg"></span>
+            </div>
+            <div id="csv-preview-panel" class="preview-panel hidden"></div>
+            <p class="hint">
+                CSV 支持的列名：<code>address</code>(或 full_address)、<code>line1</code>(street)、
+                <code>city</code>(town)、<code>state</code>(province)、
+                <code>postal_code</code>(zip/postcode)、<code>country</code>、
+                <code>external_id</code>(或 id)。
+                预览模式下先展示有效/重复/无效数量及无效行号，可点击「影响预演」用本次有效行
+                对最近 100 条不同查询做内存干跑（不写入），确认后仅写入有效记录；
+                取消勾选则沿用直接上传接口 <code>/api/addresses/upload</code>。
+            </p>
+            <div id="address-table-wrap" class="table-wrap"></div>
+        </div>
+    </section>
+
+    <!-- ========================== review queue ========================= -->
+    <section id="tab-review" class="panel">
+        <div class="card">
+            <h2>待确认队列</h2>
+            <div class="row">
+                <select id="review-filter">
+                    <option value="needs_review">仅待确认</option>
+                    <option value="">全部记录</option>
+                    <option value="reviewed">已复核</option>
+                    <option value="auto_matched">自动命中</option>
+                    <option value="no_match">无匹配</option>
+                </select>
+                <button id="btn-refresh-review" class="ghost">刷新</button>
+            </div>
+            <div id="review-groups"></div>
+            <div id="review-list"></div>
+        </div>
+    </section>
+
+    <!-- ===================== review verdict replay =================== -->
+    <section id="tab-replay" class="panel">
+        <div class="card">
+            <h2>复核结论回放</h2>
+            <p class="hint">
+                取全部<b>已复核</b>记录，以原查询在<b>当前标准地址表</b>上按<b>默认规则</b>重新匹配
+                （纯评分，不查询复核共识记忆），逐条对照人工结论：
+                确认 / 改派记录自动命中所选地址为<b>一致</b>，自动命中其他地址为<b>冲突</b>，
+                未自动命中为<b>漏命中</b>；判无匹配记录出现自动命中为<b>误命中</b>，否则为<b>一致</b>。
+                人工所选地址的 ID 与全文在复核写入时已持久保存，地址删除后仍可显示原 ID、全文与复核得分，
+                并按当前地址表标注其是否已删除；历史记录若已失去可确定的所选 ID，则标记为<b>原选择未知</b>，
+                不从候选列表猜测。用于定位规则或地址表变化带来的风险；本页只读，不写入匹配日志，也不改动复核记录。
+            </p>
+            <div class="row wrap">
+                <select id="replay-filter">
+                    <option value="">全部类别</option>
+                    <option value="consistent">一致</option>
+                    <option value="conflict">冲突</option>
+                    <option value="missed">漏命中</option>
+                    <option value="false_hit">误命中</option>
+                    <option value="unknown">原选择未知</option>
+                </select>
+                <button id="btn-refresh-replay" class="primary">重新回放</button>
+                <span id="replay-summary" class="hint"></span>
+            </div>
+            <div id="replay-list"></div>
+        </div>
+    </section>
+
+    <!-- ======================= address coverage gaps =================== -->
+    <section id="tab-gaps" class="panel">
+        <div class="card">
+            <h2>地址覆盖缺口</h2>
+            <p class="hint">
+                清单来自已保存且状态为<b>无匹配</b>的匹配日志，按归一化后的
+                <b>道路词元 + 地区词元 + 门牌号</b>归组（门牌号不同不算同一缺口）。
+                每次打开或刷新都会用<b>当前标准地址表</b>与<b>默认规则</b>重跑每组代表查询：
+                现已能自动命中的组标记为<b>已覆盖</b>（显示命中地址），
+                其余仍为<b>待补录</b>（显示当前首选候选）。此页面不写入或改写任何日志。
+            </p>
+            <div class="row wrap">
+                <select id="gaps-filter">
+                    <option value="open">仅待补录</option>
+                    <option value="covered">仅已覆盖</option>
+                    <option value="">全部</option>
+                </select>
+                <button id="btn-refresh-gaps" class="primary">重跑并刷新</button>
+                <span id="gaps-summary" class="hint"></span>
+            </div>
+            <div id="gaps-list"></div>
+        </div>
+    </section>
+
+    <!-- ==================== self-match audit ========================= -->
+    <section id="tab-audit" class="panel">
+        <div class="card">
+            <h2>标准地址自匹配巡检</h2>
+            <p class="hint">
+                对当前标准地址表中的<b>每一条记录</b>，以其全文作为查询、按<b>默认规则</b>在
+                <b>完整地址表</b>上重新评分，只列出<b>未能自动命中自身 ID</b> 的记录。
+                每条风险给出<b>自身分数</b>，以及所有得分不低于
+                <b>自身分数 − 默认分差阈值</b> 的其他地址（阻碍候选，不受前五候选截断）。
+                判定分三类：自身分数低于自动命中阈值为<b>自身分数不足</b>；自身达标但首选不是自身为
+                <b>首选偏移</b>；首选是自身但领先次高分不足为<b>分差歧义</b>。
+                上传新表后点击「重新巡检」即按最新表重新计算；本页只读，不生成匹配日志。
+            </p>
+            <div class="row wrap">
+                <select id="audit-filter">
+                    <option value="">全部风险</option>
+                    <option value="best_drifted">首选偏移</option>
+                    <option value="self_score_low">自身分数不足</option>
+                    <option value="margin_ambiguous">分差歧义</option>
+                </select>
+                <button id="btn-refresh-audit" class="primary">重新巡检</button>
+                <span id="audit-summary" class="hint"></span>
+            </div>
+            <div id="audit-list"></div>
+        </div>
+    </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

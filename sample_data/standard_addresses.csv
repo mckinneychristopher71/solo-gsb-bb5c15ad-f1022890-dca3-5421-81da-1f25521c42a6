@@ -1,0 +1,16 @@
+external_id,address,city,state,postal_code,country
+STD-001,123 Main Street,New York,NY,10001,USA
+STD-002,456 Oak Avenue,Brooklyn,NY,11201,USA
+STD-003,789 Pine Road,Chicago,IL,60601,USA
+STD-004,100 Lake Drive,Austin,TX,73301,USA
+STD-005,1000 Lake Drive,Austin,TX,73301,USA
+STD-006,321 Sunset Boulevard,Los Angeles,CA,90001,USA
+STD-007,26 SW 26th Avenue,Portland,OR,97201,USA
+STD-008,50 Hillcrest Road,Dallas,TX,75201,USA
+STD-009,52 Hillcrest Road,Dallas,TX,75202,USA
+STD-010,北京东路88号3楼,上海,,200001,China
+STD-011,南京东路15号,上海,,20002,China
+STD-012,221B Baker Street,London,,,United Kingdom
+STD-013,Friedrichstraße 12,Berlin,,10117,Germany
+STD-014,99 SW 26th Avenue,Portland,OR,97201,USA
+STD-015,742 Evergreen Terrace,Springfield,IL,62704,USA

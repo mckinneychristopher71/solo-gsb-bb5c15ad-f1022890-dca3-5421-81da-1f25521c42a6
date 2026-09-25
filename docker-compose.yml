@@ -1,0 +1,19 @@
+services:
+  address-matcher:
+    build: .
+    image: address-matcher:latest
+    container_name: address-matcher
+    ports:
+      - "8000:8000"
+    volumes:
+      - address-data:/data
+    environment:
+      # Tune the decision thresholds without rebuilding the image.
+      AUTO_THRESHOLD: "0.80"
+      MARGIN_THRESHOLD: "0.06"
+      REJECT_THRESHOLD: "0.35"
+      TOKEN_WEIGHT: "0.7"
+    restart: unless-stopped
+
+volumes:
+  address-data:
